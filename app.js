@@ -4,7 +4,7 @@
 
 // ============================================================ settings
 const CONFIG = {
-  clientId: "",                                  // Microsoft app (client) ID - can also be set in More > Settings
+  clientId: "73da0106-c7c4-4cb3-9589-d4f52d7dd817",                                  // Microsoft app (client) ID - can also be set in More > Settings
   filePath: "Finance Review/finance.db",         // in OneDrive, same as the Windows app
   authority: "https://login.microsoftonline.com/consumers/oauth2/v2.0",
   scopes: "Files.ReadWrite User.Read offline_access",
