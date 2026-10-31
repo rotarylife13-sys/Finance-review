@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Finance">
+<meta name="theme-color" content="#f4f3f0">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-180.png">
+<link rel="icon" href="icon-180.png">
+<title>Finance Review</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="top">
+  <div class="title-row">
+    <h1>Finance Review</h1>
+    <button id="syncPill" class="pill" type="button">Not signed in</button>
+  </div>
+  <div class="filters">
+    <div class="seg" id="ownerSeg">
+      <button data-v="All" class="on">All</button><button data-v="Personal">Personal</button><button data-v="Business">Business</button>
+    </div>
+    <select id="period" aria-label="Period">
+      <option>This month</option><option>Last month</option><option selected>Last 3 months</option>
+      <option>Last 6 months</option><option>Last 12 months</option><option>This year</option>
+      <option>Last year</option><option>All time</option>
+    </select>
+  </div>
+</header>
+
+<main id="main"></main>
+
+<nav class="tabs" id="tabs">
+  <button data-tab="home" class="on"><span class="ic"><svg viewBox="0 0 24 24"><path d="M3 11l9-7 9 7v9a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/></svg></span>Home</button>
+  <button data-tab="txns"><span class="ic"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg></span>Transactions</button>
+  <button data-tab="recurring"><span class="ic"><svg viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.3-5.7M20 4v5h-5"/></svg></span>Recurring</button>
+  <button data-tab="accounts"><span class="ic"><svg viewBox="0 0 24 24"><path d="M3 10l9-6 9 6M5 10v8M10 10v8M14 10v8M19 10v8M3 20h18"/></svg></span>Accounts</button>
+  <button data-tab="budget"><span class="ic"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M12 4v8l6 5"/></svg></span>Budget</button>
+  <button data-tab="assistant"><span class="ic"><svg viewBox="0 0 24 24"><path d="M12 3l1.8 4.7L18.5 9.5l-4.7 1.8L12 16l-1.8-4.7L5.5 9.5l4.7-1.8z"/><path d="M18 15l.8 2.2L21 18l-2.2.8L18 21l-.8-2.2L15 18l2.2-.8z"/></svg></span>Assistant</button>
+  <button data-tab="more"><span class="ic"><svg viewBox="0 0 24 24"><circle cx="6" cy="12" r="1.3"/><circle cx="12" cy="12" r="1.3"/><circle cx="18" cy="12" r="1.3"/></svg></span>More</button>
+</nav>
+
+<div id="sheetWrap" class="sheet-wrap" hidden>
+  <div class="sheet" role="dialog" aria-modal="true">
+    <div class="sheet-head"><h2 id="sheetTitle"></h2><button class="link" id="sheetClose" type="button">Close</button></div>
+    <div id="sheetBody" class="sheet-body"></div>
+    <div id="sheetActions" class="sheet-actions"></div>
+  </div>
+</div>
+<div id="tip" class="tip" hidden></div>
+<div id="toast" class="toast" hidden></div>
+<input type="file" id="filePick" hidden>
+
+<script src="shared.js"></script>
+<script src="sql-wasm.js"></script>
+<script src="assistant.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
