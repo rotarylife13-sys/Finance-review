@@ -90,13 +90,19 @@
     run("INSERT OR REPLACE INTO budgets VALUES (?,?,?)", [p.owner, p.category, +p.amount]); return "Budget set.";
   }
 
+  // Keys pasted on iPad sometimes pick up spaces, line breaks or invisible characters, which make the request fail before it is sent.
+  const cleanKey = k => (k || "").replace(/[^\x21-\x7E]/g, "");
   async function callApi(payload) {
-    const key = store.get("fr.apiKey", "");
+    const key = cleanKey(store.get("fr.apiKey", ""));
+    if (!/^sk-ant-[A-Za-z0-9_-]{20,}$/.test(key)) throw new Error("That doesn't look like a complete API key (it should start with sk-ant-). Re-paste it in Settings.");
     let r;
     try {
       r = await fetch(API(), { method: "POST", headers: { "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json",
         "anthropic-dangerous-direct-browser-access": "true" }, body: JSON.stringify(payload) });
-    } catch { throw new Error("Couldn't reach the Claude API - check your internet connection."); }
+    } catch (e) {
+      const online = navigator.onLine === false ? "This iPad is offline." : "";
+      throw new Error(`Couldn't reach the Claude API. ${online} Details: ${e && e.message ? e.message : e}`);
+    }
     const j = await r.json().catch(() => ({}));
     if (r.status === 401) throw new Error("The API key was rejected. Check it in Assistant settings.");
     if (!r.ok) throw new Error(`Claude API error ${r.status}: ${j?.error?.message || ""}`);
@@ -144,7 +150,12 @@
       h("div", { class: "field" }, h("span", {}, "Model"), model),
       h("p", { class: "muted" }, "Get a key at console.anthropic.com → API Keys (pay-as-you-go; a review costs a few cents). " +
         "The key stays on this iPad only.")),
-      [h("button", { class: "btn primary", onclick: () => { store.set("fr.apiKey", key.value.trim()); store.set("fr.model", model.value); closeSheet(); toast("Saved"); } }, "Save")]);
+      [h("button", { class: "btn", onclick: async () => {
+          store.set("fr.apiKey", cleanKey(key.value)); store.set("fr.model", model.value);
+          toast("Testing…", 8000);
+          try { await callApi({ model: model.value, max_tokens: 5, messages: [{ role: "user", content: "Reply OK" }] }); toast("Connection works ✓", 4000); }
+          catch (e) { toast(e.message, 9000); } } }, "Test"),
+       h("button", { class: "btn primary", onclick: () => { store.set("fr.apiKey", cleanKey(key.value)); store.set("fr.model", model.value); store.del("fr.apiUrl"); closeSheet(); toast("Saved"); } }, "Save")]);
   }
 
   // small, safe markdown renderer (escapes everything first)
