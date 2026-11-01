@@ -75,6 +75,7 @@
       return { columns: cols, rows: rows.slice(0, 200), truncated: rows.length > 200 };
     },
     propose_change(i) {
+      if (!["set_category", "add_rule", "set_budget"].includes(i.kind) || !i.summary) return { error: "propose_change needs kind and summary" };
       if (i.kind === "set_category" && !(i.transaction_ids?.length && i.category)) return { error: "set_category needs transaction_ids and category" };
       if (i.kind === "add_rule" && !(i.pattern && i.category)) return { error: "add_rule needs pattern and category" };
       if (i.kind === "set_budget" && !(["Personal", "Business"].includes(i.owner) && i.category && i.amount != null)) return { error: "set_budget needs owner, category and amount" };
@@ -109,21 +110,41 @@
     return j;
   }
 
+  // Every tool request in the history must have a matching result, so one cut-off reply can't break the chat.
+  function repair() {
+    const out = [], m = chat.messages;
+    for (let i = 0; i < m.length; i++) {
+      out.push(m[i]);
+      const ids = m[i].role === "assistant" && Array.isArray(m[i].content) ? m[i].content.filter(b => b.type === "tool_use").map(b => b.id) : [];
+      if (!ids.length) continue;
+      const nxt = m[i + 1], have = new Set(nxt && nxt.role === "user" && Array.isArray(nxt.content) ? nxt.content.map(b => b.tool_use_id) : []);
+      const missing = ids.filter(x => !have.has(x)).map(x => ({ type: "tool_result", tool_use_id: x, content: '{"error":"not run"}', is_error: true }));
+      if (!missing.length) continue;
+      if (nxt && nxt.role === "user" && Array.isArray(nxt.content)) { out.push({ ...nxt, content: [...missing, ...nxt.content] }); i++; }
+      else out.push({ role: "user", content: missing });
+    }
+    while (out.length && out.at(-1).role === "user" && Array.isArray(out.at(-1).content)) out.push({ role: "assistant", content: [{ type: "text", text: "(stopped)" }] });
+    chat.messages = out;
+  }
+
   async function ask(text) {
     if (!store.get("fr.apiKey", "")) { settings(); return; }
     chat.history.push(["you", text]); chat.busy = true; chat.step = "Thinking"; render();
     const mark = chat.messages.length;
+    repair();
     chat.messages.push({ role: "user", content: text });
     const today = new Date();
     const system = AG.system + `\nToday is ${today.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", year: "numeric" })} (${iso(today)}). The app's View filter is currently '${state.owner}'. The user is on the iPad app.`;
     try {
       for (let round = 0; round < 10; round++) {
-        const resp = await callApi({ model: store.get("fr.model", AG.models[0][0]), max_tokens: 4000, system, tools: AG.tools, messages: chat.messages });
+        const resp = await callApi({ model: store.get("fr.model", AG.models[0][0]), max_tokens: 8000, system, tools: AG.tools, messages: chat.messages });
         const content = resp.content || [];
         chat.messages.push({ role: "assistant", content });
         const uses = content.filter(b => b.type === "tool_use");
-        if (resp.stop_reason !== "tool_use" || !uses.length) {
-          chat.history.push(["claude", content.filter(b => b.type === "text").map(b => b.text).join("\n").trim() || "(no answer)"]); break;
+        if (!uses.length) {
+          let t = content.filter(b => b.type === "text").map(b => b.text).join("\n").trim();
+          if (resp.stop_reason === "max_tokens") t += "\n\n*(That answer hit the length limit - ask me to continue.)*";
+          chat.history.push(["claude", t || "(no answer)"]); break;
         }
         const results = [];
         for (const u of uses) {
@@ -137,6 +158,7 @@
       }
     } catch (e) {
       chat.messages.length = mark;     // drop the failed turn
+      repair();
       chat.history.push(["error", e.message]);
     }
     chat.busy = false; chat.step = ""; render();
