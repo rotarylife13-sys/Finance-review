@@ -134,7 +134,7 @@
     repair();
     chat.messages.push({ role: "user", content: text });
     const today = new Date();
-    const system = AG.system + `\nToday is ${today.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", year: "numeric" })} (${iso(today)}). The app's View filter is currently '${state.owner}'. The user is on the iPad app.`;
+    const system = AG.system + `\nToday is ${today.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", year: "numeric" })} (${iso(today)}). The app's View filter is currently '${state.owner}'. The user is on the iPad app.\nIncome categories: ${[...INCOME].sort().join(', ')}. Not-spending categories: ${[...NON_SPENDING].filter(c => !INCOME.has(c)).sort().join(', ')}.`;
     try {
       for (let round = 0; round < 10; round++) {
         const resp = await callApi({ model: store.get("fr.model", AG.models[0][0]), max_tokens: 8000, system, tools: AG.tools, messages: chat.messages });

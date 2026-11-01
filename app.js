@@ -97,6 +97,7 @@ function openDb(bytes) {
     st.free();
     db.run("INSERT OR REPLACE INTO settings VALUES ('seeded','1')");
   }
+  refreshKinds();
 }
 const getSetting = k => one("SELECT value FROM settings WHERE key=?", [k])?.value;
 const accounts = owner => q("SELECT * FROM accounts WHERE archived=0" + (owner && owner !== "All" ? " AND owner=?" : "") +
@@ -113,10 +114,49 @@ function txns({ owner, start, end, account, search, category } = {}) {
   return q(s + " ORDER BY t.date DESC, t.id DESC", p);
 }
 const rules = () => q("SELECT * FROM rules ORDER BY priority DESC, LENGTH(pattern) DESC");
+// How each category counts (spending / income / transfer) - same rules as the laptop app.
+function categoryKinds() {
+  const kinds = {};
+  for (const c of FR.categories) kinds[c] = FR.defaultKinds[c] || "spending";
+  for (const t of ["transactions", "rules", "budgets"]) for (const r of q(`SELECT DISTINCT category FROM ${t}`)) if (!(r.category in kinds)) kinds[r.category] = FR.defaultKinds[r.category] || "spending";
+  for (const r of q("SELECT name, kind FROM categories")) kinds[r.name] = r.kind;
+  for (const r of q("SELECT value FROM settings WHERE key LIKE 'hidden_cat:%'")) if (r.value !== "Uncategorized") delete kinds[r.value];
+  return kinds;
+}
+function refreshKinds() {
+  NON_SPENDING.clear(); INCOME.clear();
+  for (const [c, k] of Object.entries(categoryKinds())) { if (k === "income") { INCOME.add(c); NON_SPENDING.add(c); } else if (k === "transfer") NON_SPENDING.add(c); }
+}
 function categoryList() {
-  const s = new Set(FR.categories);
-  for (const t of ["transactions", "rules", "budgets"]) for (const r of q(`SELECT DISTINCT category FROM ${t}`)) s.add(r.category);
-  return [...s].sort((a, b) => (a === "Uncategorized") - (b === "Uncategorized") || a.localeCompare(b));
+  const s = new Set(Object.keys(categoryKinds())); s.add("Uncategorized");
+  return [...s].sort((a, b) => (a === "Uncategorized") - (b === "Uncategorized") || a.toLowerCase().localeCompare(b.toLowerCase()));
+}
+function setCategoryKind(name, kind) {
+  db.run("INSERT OR REPLACE INTO categories(name, kind) VALUES (?,?)", [name, kind]);
+  db.run("DELETE FROM settings WHERE key=?", ["hidden_cat:" + name]); refreshKinds(); markDirty();
+}
+function renameCategory(oldName, newName) {
+  const kind = categoryKinds()[oldName] || "spending";
+  db.run("BEGIN");
+  for (const t of ["transactions", "rules"]) db.run(`UPDATE ${t} SET category=? WHERE category=?`, [newName, oldName]);
+  for (const b of q("SELECT owner, monthly_amount FROM budgets WHERE category=?", [oldName])) {
+    db.run("DELETE FROM budgets WHERE owner=? AND category=?", [b.owner, oldName]);
+    db.run("INSERT OR REPLACE INTO budgets VALUES (?,?,?)", [b.owner, newName, b.monthly_amount]);
+  }
+  db.run("DELETE FROM categories WHERE name=?", [oldName]);
+  db.run("INSERT OR REPLACE INTO categories(name, kind) VALUES (?,?)", [newName, kind]);
+  db.run("INSERT OR REPLACE INTO settings VALUES (?,?)", ["hidden_cat:" + oldName, oldName]);
+  db.run("DELETE FROM settings WHERE key=?", ["hidden_cat:" + newName]);
+  db.run("COMMIT"); refreshKinds(); markDirty();
+}
+function deleteCategory(name, moveTo) {
+  db.run("BEGIN");
+  db.run("UPDATE transactions SET category=? WHERE category=?", [moveTo, name]);
+  db.run("UPDATE rules SET category=? WHERE category=?", [moveTo, name]);
+  db.run("DELETE FROM budgets WHERE category=?", [name]);
+  db.run("DELETE FROM categories WHERE name=?", [name]);
+  db.run("INSERT OR REPLACE INTO settings VALUES (?,?)", ["hidden_cat:" + name, name]);
+  db.run("COMMIT"); refreshKinds(); markDirty();
 }
 
 // ============================================================ categorizing (same logic as desktop)
@@ -137,23 +177,54 @@ function categorize(desc, owner, amount, rs) {
   for (const r of rs) {
     if (r.owner && r.owner !== owner) continue;
     if (ruleMatches(r.pattern, d)) {
-      if (r.category === "Income" && amount < 0) continue;
+      if (INCOME.has(r.category) && amount < 0) continue;
       return r.category;
     }
   }
   if (amount > 0 && (d.includes("DEPOSIT") || d.includes("ACH CREDIT"))) return "Income";
   return "Uncategorized";
 }
+// Same answers as categorize(), faster: cheap "is the text there at all" check before the whole-word match,
+// and remembers the answer for each (description, owner, money in/out).
+function makeCategorizer(rs) {
+  const list = rs.map(r => { ruleMatches(r.pattern, ""); return [norm(r.pattern), rxCache.get(r.pattern), r.owner, r.category]; });
+  const cache = new Map();
+  return (desc, owner, amount) => {
+    const d = norm(desc), key = d + "\u0001" + owner + "\u0001" + (amount < 0 ? "-" : amount > 0 ? "+" : "0");
+    let hit = cache.get(key);
+    if (hit !== undefined) return hit;
+    hit = null;
+    for (const [p, rx, rOwner, cat] of list) {
+      if (rOwner && rOwner !== owner) continue;
+      if (!d.includes(p) || !rx.test(d)) continue;
+      if (INCOME.has(cat) && amount < 0) continue;
+      hit = cat; break;
+    }
+    if (hit === null) hit = amount > 0 && (d.includes("DEPOSIT") || d.includes("ACH CREDIT")) ? "Income" : "Uncategorized";
+    cache.set(key, hit); return hit;
+  };
+}
 function applyRules() {
-  const rs = rules(); let n = 0;
+  refreshKinds();
+  const cat = makeCategorizer(rules());
+  const rows = q("SELECT t.id, t.description, t.amount, t.category, a.owner FROM transactions t JOIN accounts a ON a.id=t.account_id WHERE t.cat_manual=0");
+  let n = 0;
   db.run("BEGIN");
-  for (const t of txns()) {
-    if (t.cat_manual) continue;
-    const c = categorize(t.description, t.owner, t.amount, rs);
-    if (c !== t.category) { db.run("UPDATE transactions SET category=? WHERE id=?", [c, t.id]); n++; }
+  const st = db.prepare("UPDATE transactions SET category=? WHERE id=?");
+  for (const t of rows) {
+    const c = cat(t.description, t.owner, t.amount);
+    if (c !== t.category) { st.run([c, t.id]); n++; }
   }
-  db.run("COMMIT"); markDirty();
+  st.free(); db.run("COMMIT"); markDirty();
   return n;
+}
+function searchAll(text) {
+  let s = "SELECT t.*, a.name AS account, a.owner AS owner, a.type AS account_type FROM transactions t JOIN accounts a ON a.id=t.account_id " +
+    "WHERE t.description LIKE ? OR t.note LIKE ? OR t.category LIKE ? OR a.name LIKE ?";
+  const like = `%${text}%`, p = [like, like, like, like];
+  const v = parseFloat(text.replace(/[$,]/g, ""));
+  if (!isNaN(v) && /^[\s$\d.,-]+$/.test(text)) { s += " OR ABS(ABS(t.amount) - ?) < 0.005"; p.push(Math.abs(v)); }
+  return q(s + " ORDER BY t.date DESC, t.id DESC", p);
 }
 
 // ============================================================ analysis (ported from analysis.py)
@@ -551,7 +622,7 @@ $("#syncPill").onclick = () => {
 
 // ============================================================ filters
 const state = { tab: store.get("fr.tab", "home"), owner: store.get("fr.owner", "All"), period: store.get("fr.period", "Last 3 months"),
-  txnSearch: "", txnCat: "", txnAcc: "", budgetMonth: null };
+  txnSearch: "", txnCat: "", txnAcc: "", budgetMonth: null, gsearch: "", txnLimit: 400, catFilter: "" };
 function periodRange() {
   const t = new Date(), first = new Date(t.getFullYear(), t.getMonth(), 1), p = state.period;
   const back = n => new Date(first.getFullYear(), first.getMonth() - n, 1);
@@ -584,11 +655,11 @@ function hbarChart(items, onPick) {
   const g = svg("svg", { viewBox: `0 0 ${W} ${H}`, class: "chart", role: "img", "aria-label": "Spending by category" });
   items.forEach(([c, v], i) => {
     const y = 5 + i * rowH;
-    g.append(svg("text", { x: L - 8, y: y + rowH / 2 + 4, "text-anchor": "end", "font-size": 13, fill: "#0b0b0b" }, c.length > 22 ? c.slice(0, 21) + "…" : c));
+    g.append(svg("text", { x: L - 8, y: y + rowH / 2 + 4, "text-anchor": "end", "font-size": 13, fill: "#0b1620" }, c.length > 22 ? c.slice(0, 21) + "…" : c));
     const w = Math.max(2, v * sc);
-    const bar = svg("rect", { x: L, y: y + 6, width: w, height: rowH - 12, rx: 4, fill: "#2a78d6" });
+    const bar = svg("rect", { x: L, y: y + 6, width: w, height: rowH - 12, rx: 4, fill: "#3a9ad9" });
     const hit = svg("rect", { x: 0, y, width: W, height: rowH, fill: "transparent" });
-    g.append(bar, svg("text", { x: L + w + 6, y: y + rowH / 2 + 4, "font-size": 12, fill: "#52514e" }, kfmt(v)), hit);
+    g.append(bar, svg("text", { x: L + w + 6, y: y + rowH / 2 + 4, "font-size": 12, fill: "#4a5966" }, kfmt(v)), hit);
     tipOn(hit, `<b>${c}</b><br>${money(v)} · ${Math.round(v / total * 100)}% of spending${onPick && c !== "Other" ? "<br><i>Tap again to see transactions</i>" : ""}`,
       onPick && c !== "Other" ? (() => { let armed = false; return () => { if (armed) onPick(c); armed = true; setTimeout(() => (armed = false), 2500); }; })() : null);
   });
@@ -601,19 +672,19 @@ function groupedChart(months, a, b) {
   const g = svg("svg", { viewBox: `0 0 ${W} ${H}`, class: "chart", role: "img", "aria-label": "Income vs spending by month" });
   for (let i = 0; i <= 4; i++) {
     const v = max * i / 4;
-    g.append(svg("line", { x1: L, x2: W - 4, y1: y(v), y2: y(v), stroke: "#e6e5e0" }),
-      svg("text", { x: L - 6, y: y(v) + 4, "text-anchor": "end", "font-size": 11, fill: "#52514e" }, kfmt(v)));
+    g.append(svg("line", { x1: L, x2: W - 4, y1: y(v), y2: y(v), stroke: "#e3ebf2" }),
+      svg("text", { x: L - 6, y: y(v) + 4, "text-anchor": "end", "font-size": 11, fill: "#4a5966" }, kfmt(v)));
   }
   months.forEach((m, i) => {
     const cx = L + cw * i + cw / 2;
-    const r1 = svg("rect", { x: cx - bw - 1, y: y(a[i]), width: bw, height: Math.max(0, y(0) - y(a[i])), rx: 3, fill: "#2a78d6" });
-    const r2 = svg("rect", { x: cx + 1, y: y(b[i]), width: bw, height: Math.max(0, y(0) - y(b[i])), rx: 3, fill: "#eb6834" });
+    const r1 = svg("rect", { x: cx - bw - 1, y: y(a[i]), width: bw, height: Math.max(0, y(0) - y(a[i])), rx: 3, fill: "#3a9ad9" });
+    const r2 = svg("rect", { x: cx + 1, y: y(b[i]), width: bw, height: Math.max(0, y(0) - y(b[i])), rx: 3, fill: "#f0785a" });
     const hit = svg("rect", { x: cx - cw / 2, y: T, width: cw, height: H - T - B + 20, fill: "transparent" });
-    g.append(r1, r2, svg("text", { x: cx, y: H - 14, "text-anchor": "middle", "font-size": 11, fill: "#52514e" }, monthName(m)), hit);
+    g.append(r1, r2, svg("text", { x: cx, y: H - 14, "text-anchor": "middle", "font-size": 11, fill: "#4a5966" }, monthName(m)), hit);
     tipOn(hit, `<b>${monthName(m, true)}</b><br>Income ${money(a[i])}<br>Spending ${money(b[i])}<br>Net ${money(a[i] - b[i], true)}`);
   });
-  return h("div", {}, h("div", { class: "legend" }, h("span", {}, h("i", { style: "background:#2a78d6" }), "Income"),
-    h("span", {}, h("i", { style: "background:#eb6834" }), "Spending")), g);
+  return h("div", {}, h("div", { class: "legend" }, h("span", {}, h("i", { style: "background:#3a9ad9" }), "Income"),
+    h("span", {}, h("i", { style: "background:#f0785a" }), "Spending")), g);
 }
 function lineChart(pts) {
   if (pts.length < 2) return h("div", { class: "empty" }, "Not enough history yet.");
@@ -622,16 +693,16 @@ function lineChart(pts) {
   const x = i => L + (W - L - R) * i / (pts.length - 1), y = v => T + (H - T - B) * (1 - (v - lo) / (hi - lo));
   const g = svg("svg", { viewBox: `0 0 ${W} ${H}`, class: "chart", role: "img", "aria-label": "Net worth by month" });
   for (let i = 0; i <= 4; i++) { const v = lo + (hi - lo) * i / 4;
-    g.append(svg("line", { x1: L, x2: W - R + 10, y1: y(v), y2: y(v), stroke: "#e6e5e0" }), svg("text", { x: L - 6, y: y(v) + 4, "text-anchor": "end", "font-size": 11, fill: "#52514e" }, kfmt(v))); }
-  g.append(svg("polyline", { points: pts.map((p, i) => `${x(i)},${y(p[1])}`).join(" "), fill: "none", stroke: "#2a78d6", "stroke-width": 2.5, "stroke-linejoin": "round" }));
+    g.append(svg("line", { x1: L, x2: W - R + 10, y1: y(v), y2: y(v), stroke: "#e3ebf2" }), svg("text", { x: L - 6, y: y(v) + 4, "text-anchor": "end", "font-size": 11, fill: "#4a5966" }, kfmt(v))); }
+  g.append(svg("polyline", { points: pts.map((p, i) => `${x(i)},${y(p[1])}`).join(" "), fill: "none", stroke: "#3a9ad9", "stroke-width": 2.5, "stroke-linejoin": "round" }));
   const step = Math.ceil(pts.length / 8);
   pts.forEach((p, i) => {
-    g.append(svg("circle", { cx: x(i), cy: y(p[1]), r: 4, fill: "#2a78d6", stroke: "#fcfcfb", "stroke-width": 2 }));
-    if (i % step === 0 || i === pts.length - 1) g.append(svg("text", { x: x(i), y: H - 8, "text-anchor": "middle", "font-size": 11, fill: "#52514e" }, monthName(p[0].slice(0, 7))));
+    g.append(svg("circle", { cx: x(i), cy: y(p[1]), r: 4, fill: "#3a9ad9", stroke: "#fcfdfe", "stroke-width": 2 }));
+    if (i % step === 0 || i === pts.length - 1) g.append(svg("text", { x: x(i), y: H - 8, "text-anchor": "middle", "font-size": 11, fill: "#4a5966" }, monthName(p[0].slice(0, 7))));
     const hit = svg("circle", { cx: x(i), cy: y(p[1]), r: 16, fill: "transparent" });
     g.append(hit); tipOn(hit, `<b>${parseISO(p[0]).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}</b><br>Net worth ${money(p[1])}`);
   });
-  g.append(svg("text", { x: x(pts.length - 1) + 6, y: y(ys.at(-1)) - 8, "font-size": 12, fill: "#0b0b0b" }, kfmt(ys.at(-1))));
+  g.append(svg("text", { x: x(pts.length - 1) + 6, y: y(ys.at(-1)) - 8, "font-size": 12, fill: "#0b1620" }, kfmt(ys.at(-1))));
   return g;
 }
 
@@ -676,15 +747,21 @@ function viewHome() {
 
 function viewTxns() {
   const [start, end] = periodRange();
-  const ts = txns({ owner: state.owner, start, end, account: state.txnAcc || null, search: state.txnSearch || null, category: state.txnCat || null });
-  const search = h("input", { type: "search", placeholder: "Search descriptions…", value: state.txnSearch });
+  let ts;
+  if (state.gsearch) {
+    ts = searchAll(state.gsearch);
+    if (state.txnAcc) ts = ts.filter(t => String(t.account_id) === String(state.txnAcc));
+    if (state.txnCat) ts = ts.filter(t => t.category === state.txnCat);
+    if (state.txnSearch) { const ql = state.txnSearch.toLowerCase(); ts = ts.filter(t => (t.description + " " + (t.note || "")).toLowerCase().includes(ql)); }
+  } else ts = txns({ owner: state.owner, start, end, account: state.txnAcc || null, search: state.txnSearch || null, category: state.txnCat || null });
+  const search = h("input", { type: "search", placeholder: "Filter this list…", value: state.txnSearch });
   search.addEventListener("input", () => { state.txnSearch = search.value; clearTimeout(viewTxns._t); viewTxns._t = setTimeout(render, 250); });
-  const accSel = h("select", {}, h("option", { value: "" }, "All accounts"), accounts(state.owner).map(a => h("option", { value: a.id, selected: String(a.id) === String(state.txnAcc) }, a.name)));
+  const accSel = h("select", {}, h("option", { value: "" }, "All accounts"), accounts(state.gsearch ? "All" : state.owner).map(a => h("option", { value: a.id, selected: String(a.id) === String(state.txnAcc) }, a.name)));
   accSel.onchange = () => { state.txnAcc = accSel.value; render(); };
   const catSel = h("select", {}, h("option", { value: "" }, "All categories"), categoryList().map(c => h("option", { selected: c === state.txnCat }, c)));
   catSel.onchange = () => { state.txnCat = catSel.value; render(); };
   const list = h("div", { class: "list" });
-  let lastDate = null; const MAX = 400;
+  let lastDate = null; const MAX = state.txnLimit || 400;
   for (const t of ts.slice(0, MAX)) {
     if (t.date !== lastDate) { lastDate = t.date; list.append(h("div", { class: "datehead" }, parseISO(t.date).toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", year: "numeric" }))); }
     list.append(h("div", { class: "li tap", onclick: () => editTxn(t) },
@@ -694,30 +771,59 @@ function viewTxns() {
   }
   const inn = ts.filter(t => t.amount > 0).reduce((s, t) => s + t.amount, 0), out = ts.filter(t => t.amount < 0).reduce((s, t) => s + t.amount, 0);
   return h("div", {},
+    state.gsearch ? h("div", { class: "infobox" }, "Searching ", h("b", {}, "all accounts, all dates"), ` for “${state.gsearch}”. `,
+      h("button", { class: "link", onclick: () => { state.gsearch = ""; $("#gsearch").value = ""; render(); } }, "Clear search")) : null,
     search, h("div", { class: "filters", style: "margin:10px 0" }, accSel, catSel,
       (state.txnSearch || state.txnCat || state.txnAcc) ? h("button", { class: "link", onclick: () => { state.txnSearch = state.txnCat = state.txnAcc = ""; render(); } }, "Clear filters") : null),
     h("div", { class: "muted", style: "margin-bottom:8px" }, `${ts.length} transactions · in ${money(inn)} · out ${money(out)}${ts.length > MAX ? ` · showing first ${MAX}` : ""}`),
-    ts.length ? list : h("div", { class: "empty" }, "No transactions match."));
+    ts.length ? list : h("div", { class: "empty" }, "No transactions match."),
+    ts.length > MAX ? h("div", { class: "row-btns" }, h("button", { class: "btn", onclick: () => { state.txnLimit = MAX + 400; render(); } }, `Show more (${(ts.length - MAX).toLocaleString()} left)`)) : null);
+}
+
+// Type-to-filter category chooser. onChange(name) fires when one is chosen; new categories are created with a "counts as" type.
+function categoryChooser(current, onChange, { allowNew = true, filterFn = null } = {}) {
+  let chosen = current;
+  const box = h("div", {}), input = h("input", { type: "search", placeholder: "Type to find or create a category…" });
+  const chips = h("div", { class: "cats", style: "margin-top:8px;max-height:260px;overflow:auto" });
+  const newRow = h("div", { class: "newcat", hidden: true });
+  const kind = h("select", {}, Object.entries(FR.kindLabels).map(([k, l]) => h("option", { value: k }, l)));
+  const draw = () => {
+    const qv = input.value.trim().toLowerCase(), all = categoryList().filter(c => !filterFn || filterFn(c));
+    const kinds = categoryKinds();
+    chips.replaceChildren(...all.filter(c => c.toLowerCase().includes(qv)).map(c => {
+      const k = kinds[c] || "spending";
+      return h("button", { class: c === chosen ? "on" : "", onclick: () => { chosen = c; onChange(c); draw(); } },
+        c, k !== "spending" ? h("span", { class: "kindtag" }, k === "income" ? "income" : "not spending") : null);
+    }));
+    const exact = all.some(c => c.toLowerCase() === qv);
+    newRow.hidden = !(allowNew && qv && !exact);
+    if (!newRow.hidden) {
+      kind.value = /wage|salary|income|paycheck|revenue|deposit/.test(qv) ? "income" : /transfer|payment to/.test(qv) ? "transfer" : "spending";
+      newRow.replaceChildren(h("span", {}, "New: ", h("b", {}, input.value.trim()), " counts as "), kind,
+        h("button", { class: "btn", onclick: () => { const n = input.value.trim(); setCategoryKind(n, kind.value); chosen = n; input.value = ""; onChange(n); draw(); } }, "Create"));
+    }
+  };
+  input.addEventListener("input", draw);
+  draw();
+  box.append(input, newRow, chips);
+  return box;
 }
 
 function editTxn(t) {
   let chosen = t.category;
-  const cats = h("div", { class: "cats" }, categoryList().map(c => {
-    const b = h("button", { class: c === chosen ? "on" : "", onclick: () => { chosen = c; [...cats.children].forEach(x => x.classList.toggle("on", x === b)); } }, c); return b; }));
-  const newCat = h("input", { type: "text", placeholder: "Or type a new category" });
   const note = h("input", { type: "text", value: t.note || "", placeholder: "Note" });
   const mkRule = h("input", { type: "checkbox", checked: true });
   const key = merchantKey(t.description);
   sheet(t.description, h("div", {},
     h("p", { class: "muted" }, `${parseISO(t.date).toLocaleDateString()} · ${t.account} (${t.owner}) · `, amtCell(t.amount)),
-    h("div", { class: "field" }, h("span", {}, "Category"), cats, newCat),
+    h("div", { class: "field" }, h("span", {}, "Category"), categoryChooser(chosen, c => (chosen = c))),
     h("label", { class: "field", style: "flex-direction:row;align-items:center;gap:8px" }, mkRule,
       h("span", { style: "font-size:15px;color:inherit" }, `Also use this category for everything from “${key}” (makes a rule)`)),
     h("div", { class: "field" }, h("span", {}, "Note"), note),
     t.cat_manual ? h("button", { class: "link", onclick: () => { run("UPDATE transactions SET cat_manual=0 WHERE id=?", [t.id]); applyRules(); closeSheet(); render(); } }, "Let rules decide this category again") : null),
     [h("button", { class: "btn danger", onclick: () => confirmSheet("Delete transaction?", t.description, "Delete", () => { run("DELETE FROM transactions WHERE id=?", [t.id]); render(); }, true) }, "Delete"),
      h("button", { class: "btn primary", onclick: () => {
-       const cat = newCat.value.trim() || chosen;
+       const cat = chosen;
        run("UPDATE transactions SET category=?, cat_manual=1, note=? WHERE id=?", [cat, note.value, t.id]);
        if (mkRule.checked && cat !== t.category && cat !== "Uncategorized") {
          run("INSERT INTO rules(pattern, category, owner, priority) VALUES (?,?,?,10)", [key, cat, t.owner]);
@@ -816,9 +922,8 @@ function viewBudget() {
   return h("div", {},
     h("div", { class: "filters", style: "margin-bottom:10px" }, sel,
       editable ? h("button", { class: "btn", onclick: () => {
-        const cats = categoryList().filter(c => !NON_SPENDING.has(c) && c !== "Uncategorized");
-        const pick = h("div", { class: "cats" }, cats.map(c => h("button", { onclick: () => ask(c, budgetsFor(state.owner)[c]) }, c)));
-        sheet("Set a budget for…", pick); } }, "Set a budget") : null,
+        sheet("Set a budget for…", categoryChooser("", c => ask(c, budgetsFor(state.owner)[c]),
+          { filterFn: c => !NON_SPENDING.has(c) && c !== "Uncategorized" })); } }, "Set a budget") : null,
       editable ? h("button", { class: "btn", onclick: () => { let n = 0;
         for (const r of rows) if (!r.budget && r.avg3 >= 10 && r.category !== "Uncategorized") { run("INSERT OR REPLACE INTO budgets VALUES (?,?,?)", [state.owner, r.category, Math.round(r.avg3 / 10 + .5) * 10]); n++; }
         toast(`Set ${n} budgets from your 3-month average`); render(); } }, "Fill blanks from 3-mo avg") : null),
@@ -848,12 +953,63 @@ function viewMore() {
         h("button", { class: "btn", onclick: openLocalFile }, "Open a .db file"),
         db ? h("button", { class: "btn", onclick: saveCopy }, "Save a copy") : null,
         auth.signedIn() ? h("button", { class: "btn danger", onclick: () => { auth.signOut(); location.reload(); } }, "Sign out") : null)),
+    db && window.FRLock ? FRLock.settingsView() : null,
+    db ? viewCategories() : null,
     db ? viewRules() : null,
     h("div", { class: "section-title" }, "Settings"),
     h("div", { class: "card" },
       h("div", { class: "field" }, h("span", {}, "Microsoft app (client) ID - from the setup guide"), cid),
       h("button", { class: "btn", onclick: () => { store.set("fr.clientId", cid.value.trim()); toast("Saved"); } }, "Save")),
     h("p", { class: "muted", style: "margin-top:16px" }, "Tip: in Safari, tap Share › Add to Home Screen to use this like an app."));
+}
+function viewCategories() {
+  const kinds = categoryKinds(), counts = Object.fromEntries(q("SELECT category, COUNT(*) AS n FROM transactions GROUP BY category").map(r => [r.category, r.n]));
+  const filter = h("input", { type: "search", placeholder: "Search categories…", value: state.catFilter || "" });
+  filter.addEventListener("input", () => { state.catFilter = filter.value; clearTimeout(viewCategories._t); viewCategories._t = setTimeout(() => { render(); const f = $("#catfilter"); if (f) { f.focus(); f.setSelectionRange(f.value.length, f.value.length); } }, 300); });
+  filter.id = "catfilter";
+  const ql = (state.catFilter || "").toLowerCase();
+  const label = k => k === "income" ? "Income" : k === "transfer" ? "Not spending" : "Spending";
+  const edit = c => {
+    const name = h("input", { type: "text", value: c });
+    const kind = h("select", {}, Object.entries(FR.kindLabels).map(([k, l]) => h("option", { value: k, selected: (kinds[c] || "spending") === k }, l)));
+    sheet(c, h("div", {},
+      h("div", { class: "field" }, h("span", {}, "Name"), name),
+      h("div", { class: "field" }, h("span", {}, "Counts as"), kind),
+      h("p", { class: "muted" }, `${(counts[c] || 0).toLocaleString()} transactions use this category. Renaming updates them, its rules and budgets.`)),
+      [c !== "Uncategorized" ? h("button", { class: "btn danger", onclick: () => {
+          let target = "Uncategorized";
+          sheet(`Delete “${c}”`, h("div", {}, h("p", {}, `Move its ${counts[c] || 0} transactions and its rules to:`),
+            categoryChooser(target, x => (target = x), { filterFn: x => x !== c })),
+            [h("button", { class: "btn", onclick: closeSheet }, "Cancel"),
+             h("button", { class: "btn danger", onclick: () => { deleteCategory(c, target); closeSheet(); toast(`Deleted ${c}`); render(); } }, "Delete and move")]);
+        } }, "Delete…") : null,
+       h("button", { class: "btn primary", onclick: () => {
+         const n = name.value.trim();
+         if (!n) return;
+         if (n !== c && c !== "Uncategorized") {
+           if (categoryList().some(x => x.toLowerCase() === n.toLowerCase() && x !== c)) deleteCategory(c, categoryList().find(x => x.toLowerCase() === n.toLowerCase()));
+           else renameCategory(c, n);
+         }
+         setCategoryKind(n !== c && c !== "Uncategorized" ? n : c, kind.value);
+         closeSheet(); render(); } }, "Save")].filter(Boolean));
+  };
+  const add = () => {
+    const name = h("input", { type: "text", placeholder: "e.g. Wages - Vast" });
+    const kind = h("select", {}, Object.entries(FR.kindLabels).map(([k, l]) => h("option", { value: k }, l)));
+    name.addEventListener("input", () => { const v = name.value.toLowerCase(); kind.value = /wage|salary|income|paycheck|revenue/.test(v) ? "income" : /transfer/.test(v) ? "transfer" : "spending"; });
+    sheet("Add category", h("div", {}, h("div", { class: "field" }, h("span", {}, "Name"), name), h("div", { class: "field" }, h("span", {}, "Counts as"), kind),
+      h("p", { class: "muted" }, "Spending adds to spending totals, Income adds to income, Not spending (transfers, card payments) is left out of both.")),
+      [h("button", { class: "btn primary", onclick: () => { const n = name.value.trim(); if (!n) return;
+        if (categoryList().some(x => x.toLowerCase() === n.toLowerCase())) { toast("That category already exists"); return; }
+        setCategoryKind(n, kind.value); closeSheet(); toast(`Added ${n}`); render(); } }, "Add")]);
+    setTimeout(() => name.focus(), 50);
+  };
+  return h("div", {},
+    h("div", { class: "section-title" }, "Categories"),
+    h("div", { class: "filters", style: "margin:0 0 8px" }, filter, h("button", { class: "btn primary", onclick: add }, "Add category")),
+    h("div", { class: "list" }, categoryList().filter(c => c.toLowerCase().includes(ql)).map(c => h("div", { class: "li tap", onclick: () => edit(c) },
+      h("div", { class: "main" }, h("div", { class: "l1" }, c), h("div", { class: "l2" }, `${label(kinds[c] || "spending")} · ${(counts[c] || 0).toLocaleString()} transactions`)),
+      h("span", { class: "muted" }, "Edit")))));
 }
 function viewRules() {
   const mine = rules().filter(r => r.priority > 0);
@@ -948,7 +1104,7 @@ function saveCopy() {
 
 // ============================================================ shell
 const VIEWS = { home: viewHome, txns: viewTxns, recurring: viewRecurring, accounts: viewAccounts, budget: viewBudget, more: viewMore, ...(window.VIEWS_EXTRA || {}) };
-function setTab(t) { state.tab = t; store.set("fr.tab", t); render(); scrollTo(0, 0); }
+function setTab(t) { state.txnLimit = 400; state.tab = t; store.set("fr.tab", t); render(); scrollTo(0, 0); }
 function render() {
   document.querySelectorAll("#tabs button").forEach(b => b.classList.toggle("on", b.dataset.tab === state.tab));
   document.querySelectorAll("#ownerSeg button").forEach(b => b.classList.toggle("on", b.dataset.v === state.owner));
@@ -960,15 +1116,23 @@ function render() {
 }
 document.querySelectorAll("#tabs button").forEach(b => (b.onclick = () => setTab(b.dataset.tab)));
 document.querySelectorAll("#ownerSeg button").forEach(b => (b.onclick = () => { state.owner = b.dataset.v; store.set("fr.owner", state.owner); state.txnAcc = ""; render(); }));
+$("#gsearch").addEventListener("input", e => {
+  clearTimeout(window.__gs); window.__gs = setTimeout(() => {
+    state.gsearch = e.target.value.trim(); state.txnLimit = 400; state.txnAcc = ""; state.txnCat = "";
+    if (state.gsearch && state.tab !== "txns") setTab("txns"); else render();
+    const g = $("#gsearch"); g.focus();
+  }, 350);
+});
 $("#period").onchange = e => { state.period = e.target.value; store.set("fr.period", state.period); render(); };
 window.addEventListener("beforeunload", e => { if (sync.dirty && sync.mode === "onedrive") { saveToOneDrive(); e.preventDefault(); } });
 
 (async function start() {
   render();
-  SQL = await initSqlJs({ locateFile: f => f + "?v=202610312209" });
+  SQL = await initSqlJs({ locateFile: f => f + "?v=202611010832" });
   try { await auth.handleRedirect(); } catch (e) { toast(e.message, 6000); }
   if (auth.signedIn()) { await loadFromOneDrive(); }
   else setPill("Not signed in", "off");
   render();
+  if (window.FRLock) FRLock.checkAfterLoad();
 })();
 window.__fr = { get db() { return db; }, openDb, render, sync, auth, applyRules, merchantKey, categorize, parseDate, CsvFile };

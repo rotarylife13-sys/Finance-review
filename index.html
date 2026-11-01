@@ -7,12 +7,12 @@
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="apple-mobile-web-app-title" content="Finance">
-<meta name="theme-color" content="#f4f3f0">
+<meta name="theme-color" content="#f1f5f9">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="apple-touch-icon" href="icon-180.png">
 <link rel="icon" href="icon-180.png">
 <title>Finance Review</title>
-<link rel="stylesheet" href="app.css?v=202610312209">
+<link rel="stylesheet" href="app.css?v=202611010832">
 </head>
 <body>
 <header class="top">
@@ -24,6 +24,7 @@
     <div class="seg" id="ownerSeg">
       <button data-v="All" class="on">All</button><button data-v="Personal">Personal</button><button data-v="Business">Business</button>
     </div>
+    <input id="gsearch" type="search" placeholder="Search all transactions…" aria-label="Search all transactions" autocomplete="off">
     <select id="period" aria-label="Period">
       <option>This month</option><option>Last month</option><option selected>Last 3 months</option>
       <option>Last 6 months</option><option>Last 12 months</option><option>This year</option>
@@ -51,13 +52,15 @@
     <div id="sheetActions" class="sheet-actions"></div>
   </div>
 </div>
+<div id="lockScreen" class="lockscreen" hidden></div>
 <div id="tip" class="tip" hidden></div>
 <div id="toast" class="toast" hidden></div>
 <input type="file" id="filePick" hidden>
 
-<script src="shared.js?v=202610312209"></script>
-<script src="sql-wasm.js?v=202610312209"></script>
-<script src="assistant.js?v=202610312209"></script>
-<script src="app.js?v=202610312209"></script>
+<script src="shared.js?v=202611010832"></script>
+<script src="sql-wasm.js?v=202611010832"></script>
+<script src="assistant.js?v=202611010832"></script>
+<script src="app.js?v=202611010832"></script>
+<script src="lock.js?v=202611010832"></script>
 </body>
 </html>

@@ -1,4 +1,4 @@
 { "name": "Finance Review", "short_name": "Finance", "start_url": "./", "display": "standalone",
-  "background_color": "#f4f3f0", "theme_color": "#f4f3f0",
+  "background_color": "#f1f5f9", "theme_color": "#f1f5f9",
   "icons": [ { "src": "icon-180.png", "sizes": "180x180", "type": "image/png" },
              { "src": "icon-512.png", "sizes": "512x512", "type": "image/png" } ] }
