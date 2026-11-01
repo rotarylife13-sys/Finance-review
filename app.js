@@ -965,7 +965,7 @@ window.addEventListener("beforeunload", e => { if (sync.dirty && sync.mode === "
 
 (async function start() {
   render();
-  SQL = await initSqlJs({ locateFile: f => f + "?v=202610311734" });
+  SQL = await initSqlJs({ locateFile: f => f + "?v=202610312045" });
   try { await auth.handleRedirect(); } catch (e) { toast(e.message, 6000); }
   if (auth.signedIn()) { await loadFromOneDrive(); }
   else setPill("Not signed in", "off");
