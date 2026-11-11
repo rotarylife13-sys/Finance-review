@@ -8,7 +8,7 @@
   const ownerOf = i => i.owner || "All";
   const monthsBack = n => { const t = new Date(); return iso(new Date(t.getFullYear(), t.getMonth() - (n - 1), 1)); };
   const STEP = { get_overview: "Reading your overview", get_monthly_trend: "Comparing months", get_recurring: "Checking recurring charges",
-    get_budget: "Checking budgets", get_accounts: "Looking at accounts", search_transactions: "Searching transactions",
+    get_budget: "Checking budgets", get_paycheck_plan: "Working out your paycheck", create_report: "Checking reports", get_accounts: "Looking at accounts", search_transactions: "Searching transactions",
     run_sql: "Digging into the data", propose_change: "Preparing a suggestion" };
 
   const chat = { messages: [], history: [], proposals: [], busy: false, step: "" };
@@ -43,6 +43,14 @@
       const owner = ownerOf(i), month = i.month || iso(new Date()).slice(0, 7), { rows, end } = budgetReport(owner, month);
       return { owner, month, month_end: end, today: iso(new Date()),
         rows: rows.map(r => ({ category: r.category, budget: r2(r.budget), actual: r2(r.actual), avg3: r2(r.avg3) })) };
+    },
+    get_paycheck_plan(i) {
+      const p = FRPlanner.plan(Math.max(0, Math.min(+(i.offset || 0), 12)));
+      if (p.needs_setup) return { error: "No regular paycheck found in Personal accounts. The user can add one in the Paycheck tab." };
+      delete p.income_sources; return { today: iso(new Date()), ...p };
+    },
+    create_report() {
+      return { error: "Reports (PDF + Excel) are created in the Finance Review app on the laptop, not on the iPad. Tell the user: on the laptop use File > Create a report, or ask the Assistant there. The files can be saved in OneDrive to open them on the iPad." };
     },
     get_accounts(i) {
       return { accounts: netWorth(ownerOf(i)).rows.map(([a, b]) => {
